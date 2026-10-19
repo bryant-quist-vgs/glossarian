@@ -218,3 +218,23 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# glossarian project rules (below the stock GitHub Python template above).
+# uv.lock IS tracked: this is an application with console scripts, not a library.
+# ---------------------------------------------------------------------------
+
+# macOS metadata
+.DS_Store
+
+# Claude Code session-local state. Shared project config (.claude/settings.json,
+# skills, hooks) stays committable; per-machine files do not.
+.claude/.cc-writes/
+.claude/settings.local.json
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
