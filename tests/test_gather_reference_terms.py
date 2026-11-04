@@ -1,4 +1,11 @@
-"""test_gather_reference_terms — tests for glossarian.gather_reference_terms, contract v2.
+"""test_gather_reference_terms — tests for glossarian.gather_reference_terms, contract v3.
+
+v3 coverage (appended at the end of the file): link paths resolve relative to the linking
+file (a `docs/`-prefixed link from a subdirectory is `missing-glossary`); a linking file
+outside the glossary's `governs` scope is `out-of-scope`; a target without `id: glossary`
+is `not-a-glossary`; a glossary with an unsafe/absent `governs` is `invalid-scope`; several
+glossaries are reported side by side; `--glossary` narrows the report; `--repo-root` bounds
+the scope; the JSON carries `glossaries` and per-reference `status`.
 
 Coverage (one or more tests per contract behavior / load-bearing annotation):
   - Behavior 1 (scan set): archived docs (front-matter `archived: true`) are skipped;
@@ -46,6 +53,12 @@ id: glossary
 
 # Glossary
 
+## Governance
+
+```glossary
+governs: ../
+```
+
 ## Definitions
 
 ### working agent
@@ -69,15 +82,17 @@ REFS_MD = (
     "Ghost [g](glossary.md#ghost-term).\n"
 )
 
-# A subdir doc exercising relative (`../`) and path-prefixed (`docs/`) link forms.
-SYS_MD = "# Sys\nRelative [wa](../glossary.md#working-agent).\nPrefixed [def](docs/glossary.md#definitions).\n"
+# A subdir doc exercising the relative (`../`) link form, including to a section anchor.
+SYS_MD = "# Sys\nRelative [wa](../glossary.md#working-agent).\nSection [def](../glossary.md#definitions).\n"
 
 # Archived: must be skipped; its reference must never appear in the findings.
 ARCHIVED_MD = "---\narchived: true\n---\n# Archived\n[no](glossary.md#archived-only).\n"
 
 
 def make_tree(tmp_path: Path, glossary_text: str, docs: dict[str, str]) -> Path:
-    """Write docs/glossary.md + the given docs under a fresh docs/ root; return the root."""
+    """Write docs/glossary.md + the given docs under a fresh docs/ root inside a fake repository
+    (tmp_path/.git bounds every `governs` scope); return the root."""
+    (tmp_path / ".git").mkdir(exist_ok=True)
     root = tmp_path / "docs"
     root.mkdir()
     (root / "glossary.md").write_text(glossary_text, encoding="utf-8")
@@ -98,6 +113,17 @@ def run_json(tmp_path: Path, root: Path, *flags: str) -> tuple[int, dict | None]
 
 def std_tree(tmp_path: Path) -> Path:
     return make_tree(tmp_path, GLOSSARY, {"refs.md": REFS_MD, "diagrams/sys.md": SYS_MD, "archived.md": ARCHIVED_MD})
+
+
+def T(data: dict, slug: str) -> dict:
+    """The term finding for `slug` (v3 keys are `<glossary>#<slug>`; the std tree has one glossary)."""
+    matches = [v for k, v in data["terms"].items() if k.endswith(f"#{slug}")]
+    assert len(matches) == 1, f"expected one finding for {slug}, got {list(data['terms'])}"
+    return matches[0]
+
+
+def has_term(data: dict, slug: str) -> bool:
+    return any(k.endswith(f"#{slug}") for k in data["terms"])
 
 
 # --------------------------------------------------------------------------- #
@@ -127,7 +153,7 @@ def test_section_heading_resolves(tmp_path: Path) -> None:
     # Load-bearing behavior 3: the anchor set is ALL headings, not Definitions terms only,
     # so a link to `#definitions` resolves.
     _rc, data = run_json(tmp_path, std_tree(tmp_path))
-    assert data["terms"]["definitions"]["resolved"] is True
+    assert T(data, "definitions")["resolved"] is True
 
 
 def test_arrow_slug_fidelity(tmp_path: Path) -> None:
@@ -135,16 +161,20 @@ def test_arrow_slug_fidelity(tmp_path: Path) -> None:
     # hand-written hyphen-only inbound slug does NOT resolve. Proves the shared slug is used.
     assert github_slug("requirements → items LLM") == "requirements-→-items-llm"
     _rc, data = run_json(tmp_path, std_tree(tmp_path))
-    assert data["terms"]["requirements-items-llm"]["resolved"] is False
+    assert T(data, "requirements-items-llm")["resolved"] is False
 
 
 def test_bold_paragraph_glossary_resolves_nothing(tmp_path: Path) -> None:
     # The pre-migration glossary defines terms as bold paragraphs (not headings); none of
     # the term anchors exist, so the term links are unresolved (the tool's 2.4 evidence).
-    bold = "---\nid: glossary\n---\n\n# Glossary\n\n## Definitions\n\n**working agent**\nThe agent.\n"
+    bold = (
+        "---\nid: glossary\n---\n\n# Glossary\n\n## Governance\n\n```glossary\ngoverns: ../\n```\n\n"
+        "## Definitions\n\n**working agent**\nThe agent.\n"
+    )
     root = make_tree(tmp_path, bold, {"d.md": "[wa](glossary.md#working-agent)\n"})
     rc, data = run_json(tmp_path, root)
-    assert data["terms"]["working-agent"]["resolved"] is False
+    assert T(data, "working-agent")["resolved"] is False
+    assert T(data, "working-agent")["status"] == "unresolved-anchor"
     assert rc == 1
 
 
@@ -154,31 +184,31 @@ def test_bold_paragraph_glossary_resolves_nothing(tmp_path: Path) -> None:
 
 
 def test_link_forms_all_extracted(tmp_path: Path) -> None:
-    # Load-bearing behavior 2: direct, relative (../), and path-prefixed (docs/) forms.
+    # Load-bearing behavior 2: direct and relative (../) forms resolve to the same glossary.
     _rc, data = run_json(tmp_path, std_tree(tmp_path))
-    files_for_wa = {r["file"] for r in data["terms"]["working-agent"]["references"]}
+    files_for_wa = {r["file"] for r in T(data, "working-agent")["references"]}
     # direct (refs.md) + relative ../glossary.md (diagrams/sys.md) both counted
     assert any(f.endswith("refs.md") for f in files_for_wa)
     assert any(f.endswith("sys.md") for f in files_for_wa)
-    # path-prefixed docs/glossary.md#definitions resolved from the subdir doc
-    assert any(r["file"].endswith("sys.md") for r in data["terms"]["definitions"]["references"])
+    # the section anchor linked relatively from the subdir doc resolves too
+    assert any(r["file"].endswith("sys.md") for r in T(data, "definitions")["references"])
 
 
 def test_duplicate_references_on_one_line_dedupe(tmp_path: Path) -> None:
     # Load-bearing behavior 2: two working-agent links share refs.md:2 -> one file:line.
     _rc, data = run_json(tmp_path, std_tree(tmp_path))
-    refs = data["terms"]["working-agent"]["references"]
+    refs = T(data, "working-agent")["references"]
     refs_in_refs_md = [r for r in refs if r["file"].endswith("refs.md")]
-    assert refs_in_refs_md == [{"file": refs_in_refs_md[0]["file"], "line": 2}]  # exactly one, line 2
-    assert data["terms"]["working-agent"]["reference_count"] == len(refs)
+    assert refs_in_refs_md == [{"file": refs_in_refs_md[0]["file"], "line": 2, "status": "resolved"}]  # one, line 2
+    assert T(data, "working-agent")["reference_count"] == len(refs)
 
 
 def test_underscore_and_hyphen_slugs(tmp_path: Path) -> None:
     # Load-bearing behavior 2: underscore slugs (human_holds) and hyphenated (working-agent)
     # are both captured verbatim (underscores preserved by github_slug).
     _rc, data = run_json(tmp_path, std_tree(tmp_path))
-    assert "human_holds" in data["terms"] and data["terms"]["human_holds"]["resolved"] is True
-    assert "working-agent" in data["terms"]
+    assert has_term(data, "human_holds") and T(data, "human_holds")["resolved"] is True
+    assert has_term(data, "working-agent")
 
 
 def test_myglossary_basename_not_matched(tmp_path: Path) -> None:
@@ -196,7 +226,7 @@ def test_myglossary_basename_not_matched(tmp_path: Path) -> None:
 def test_archived_doc_skipped(tmp_path: Path) -> None:
     # Load-bearing behavior 1: skip files whose front matter has archived: true.
     _rc, data = run_json(tmp_path, std_tree(tmp_path))
-    assert "archived-only" not in data["terms"]
+    assert not has_term(data, "archived-only")
     assert data["files_scanned"] == 3  # glossary.md + refs.md + diagrams/sys.md
     assert not any("archived.md" in f for f in data["files"])
 
@@ -212,7 +242,7 @@ def test_default_scope_lists_resolved_and_unresolved(tmp_path: Path, capsys) -> 
     assert "Resolved (3):" in out
     assert "Unresolved (2):" in out
     assert out.rstrip().endswith("FAILED")
-    assert "Files scanned: 3 | Terms resolved: 3 | Terms unresolved: 2" in out
+    assert "Files scanned: 3 | Glossaries: 1 | Terms resolved: 3 | Terms unresolved: 2" in out
 
 
 def test_failures_scope_omits_resolved(tmp_path: Path, capsys) -> None:
@@ -220,7 +250,7 @@ def test_failures_scope_omits_resolved(tmp_path: Path, capsys) -> None:
     out = capsys.readouterr().out
     assert "Resolved (" not in out
     assert "Unresolved (2):" in out
-    assert "ghost-term" in out and "working-agent" not in out
+    assert "ghost-term" in out and "#working-agent" not in out
 
 
 def test_terms_only_omits_file_lines(tmp_path: Path, capsys) -> None:
@@ -341,14 +371,25 @@ def test_json_parent_dir_missing_exits_2(tmp_path: Path) -> None:
 def test_json_shape_is_the_machine_contract(tmp_path: Path) -> None:
     # Load-bearing: the JSON shape is the contract for downstream consumers (2.4/5.1, CI).
     _rc, data = run_json(tmp_path, std_tree(tmp_path))
-    assert set(data) == {"docs_root", "glossary", "files_scanned", "files", "terms", "summary"}
-    assert set(data["summary"]) == {"files_scanned", "terms_total", "resolved", "unresolved", "result"}
-    term = data["terms"]["working-agent"]
-    assert set(term) == {"resolved", "reference_count", "references"}
-    assert set(term["references"][0]) == {"file", "line"}
+    assert set(data) == {"docs_root", "glossary", "glossaries", "files_scanned", "files", "terms", "summary"}
+    assert set(data["summary"]) == {
+        "files_scanned",
+        "glossaries",
+        "terms_total",
+        "resolved",
+        "unresolved",
+        "references_by_status",
+        "result",
+    }
+    term = T(data, "working-agent")
+    assert set(term) == {"glossary", "slug", "resolved", "status", "reference_count", "references"}
+    assert set(term["references"][0]) == {"file", "line", "status"}
+    (ginfo,) = data["glossaries"].values()
+    assert set(ginfo) == {"exists", "is_glossary", "anchor_count", "governs", "scope", "error"}
+    assert ginfo["governs"] == "../" and ginfo["error"] is None
     # deterministic ordering: terms keys sorted, references sorted by (file, line)
     assert list(data["terms"]) == sorted(data["terms"])
-    refs = data["terms"]["working-agent"]["references"]
+    refs = T(data, "working-agent")["references"]
     assert refs == sorted(refs, key=lambda r: (r["file"], r["line"]))
 
 
@@ -401,3 +442,100 @@ def test_only_write_is_json_file_inputs_untouched(tmp_path: Path) -> None:
     assert out.exists()  # the one declared write
     for p, content in before.items():
         assert p.read_text(encoding="utf-8") == content  # every input byte-for-byte unchanged
+
+
+# --------------------------------------------------------------------------- #
+# v3 — path resolution, governed scope, several glossaries                      #
+# --------------------------------------------------------------------------- #
+
+
+def test_docs_prefixed_link_from_subdir_is_missing_glossary(tmp_path: Path) -> None:
+    # v3: paths resolve relative to the linking file, as GitHub does. From docs/diagrams/,
+    # `docs/glossary.md` names docs/diagrams/docs/glossary.md, which does not exist.
+    root = make_tree(tmp_path, GLOSSARY, {"diagrams/s.md": "[d](docs/glossary.md#working-agent)\n"})
+    out = tmp_path / "r.json"
+    rc = grt.main([str(root), "--quiet", "--json", str(out)])  # no --glossary filter
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert rc == 1
+    assert T(data, "working-agent")["status"] == "missing-glossary"
+    missing = next(g for g in data["glossaries"].values() if not g["exists"])
+    assert missing["is_glossary"] is False
+
+
+def test_link_from_outside_scope_is_out_of_scope(tmp_path: Path) -> None:
+    # Load-bearing v3: a glossary governing only its own directory does not cover a sibling.
+    glossary = GLOSSARY.replace("governs: ../", "governs: .")
+    root = make_tree(tmp_path, glossary, {"in.md": "[a](glossary.md#working-agent)\n"})
+    outside = tmp_path / "notes"
+    outside.mkdir()
+    (outside / "o.md").write_text("[b](../docs/glossary.md#working-agent)\n", encoding="utf-8")
+    rc = grt.main([str(tmp_path), "--quiet", "--json", str(tmp_path / "r.json")])
+    data = json.loads((tmp_path / "r.json").read_text(encoding="utf-8"))
+    assert rc == 1
+    term = T(data, "working-agent")
+    statuses = {Path(r["file"]).name: r["status"] for r in term["references"]}
+    assert statuses == {"in.md": "resolved", "o.md": "out-of-scope"}
+    assert term["status"] == "out-of-scope" and term["resolved"] is False
+    assert root.exists()
+
+
+def test_target_without_glossary_id_is_not_a_glossary(tmp_path: Path) -> None:
+    root = make_tree(tmp_path, GLOSSARY.replace("id: glossary", "id: notes"), {"d.md": "[a](glossary.md#x)\n"})
+    rc, data = run_json(tmp_path, root)
+    assert rc == 1 and T(data, "x")["status"] == "not-a-glossary"
+
+
+def test_glossary_with_unsafe_or_missing_governs_is_invalid_scope(tmp_path: Path) -> None:
+    cases = {
+        "escape": GLOSSARY.replace("governs: ../", "governs: ../../../"),
+        "absent": GLOSSARY.replace("governs: ../\n", ""),
+    }
+    for name, glossary in cases.items():
+        base = tmp_path / name
+        base.mkdir()
+        root = make_tree(base, glossary, {"d.md": "[a](glossary.md#working-agent)\n"})
+        rc, data = run_json(base, root)
+        assert rc == 1
+        assert T(data, "working-agent")["status"] == "invalid-scope"
+        (ginfo,) = data["glossaries"].values()
+        assert ginfo["error"]
+
+
+def test_two_glossaries_reported_side_by_side(tmp_path: Path, capsys) -> None:
+    root = make_tree(tmp_path, GLOSSARY, {"d.md": "[a](glossary.md#working-agent) [k](../kb/glossary.md#kb-term)\n"})
+    kb = tmp_path / "kb"
+    kb.mkdir()
+    (kb / "glossary.md").write_text(
+        GLOSSARY.replace("governs: ../", "governs: .").replace("### working agent", "### kb term"), encoding="utf-8"
+    )
+    (kb / "n.md").write_text("[k](glossary.md#kb-term) [w](../docs/glossary.md#working-agent)\n", encoding="utf-8")
+    rc = grt.main([str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 1  # docs/d.md -> kb glossary is out of scope (kb governs only kb/)
+    assert "Glossaries: 2" in out
+    assert "#kb-term  [out-of-scope]" in out
+    assert "n.md:1  [resolved]" in out  # the in-scope reference is tagged under the failing term
+    assert root.exists()
+
+
+def test_glossary_flag_narrows_the_report(tmp_path: Path) -> None:
+    root = make_tree(tmp_path, GLOSSARY, {"d.md": "[a](glossary.md#working-agent) [m](../other/glossary.md#x)\n"})
+    rc, data = run_json(tmp_path, root)  # run_json passes --glossary docs/glossary.md
+    assert rc == 0  # the dangling ../other/glossary.md link is outside the filter
+    assert list(data["glossaries"]) == [str(root / "glossary.md")]
+    assert data["glossary"] == str(root / "glossary.md")
+    out = tmp_path / "all.json"
+    assert grt.main([str(root), "--quiet", "--json", str(out)]) == 1  # no filter: everything is checked
+    assert json.loads(out.read_text(encoding="utf-8"))["summary"]["glossaries"] == 2
+
+
+def test_repo_root_override_bounds_scope(tmp_path: Path) -> None:
+    # Without a .git the scope cannot be bounded (invalid-scope); --repo-root supplies the bound.
+    root = tmp_path / "loose" / "docs"
+    root.mkdir(parents=True)
+    (root / "glossary.md").write_text(GLOSSARY, encoding="utf-8")
+    (root / "d.md").write_text("[a](glossary.md#working-agent)\n", encoding="utf-8")
+    if grt.scope.find_repo_root(root) is None:
+        assert grt.main([str(root), "--quiet"]) == 1
+    assert grt.main([str(root), "--repo-root", str(tmp_path / "loose"), "--quiet"]) == 0
+    assert grt.main([str(root), "--repo-root", str(tmp_path / "nope"), "--quiet"]) == 2

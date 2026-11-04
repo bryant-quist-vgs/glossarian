@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# glossarian_install.sh - install PATH shims (glossarian-check, glossarian-gather) for this checkout.
-# Built against contract v0 (glossarian_install_contract.md).
+# glossarian_install.sh - install PATH shims (glossarian-check, -gather, -template, -fix) for this checkout.
+# Built against contract v1 (glossarian_install_contract.md).
 
 set -euo pipefail
 unset CDPATH
 
 MARKER="managed-by: glossarian-install"
-NAMES="check gather"
+NAMES="check gather template fix"
 TMP_FILE=""
 
 cleanup_tmp() {
@@ -23,7 +23,7 @@ Usage: glossarian_install.sh [--prefix DIR] [--dry-run]
        glossarian_install.sh --help
 
 Installs one bash shim per glossarian command into DIR (default: $HOME/.local/bin):
-  glossarian-check glossarian-gather
+  glossarian-check glossarian-gather glossarian-template glossarian-fix
 Each shim runs: uv run --project "<this checkout>" --no-dev glossarian-<name> "$@"
 and carries a '# managed-by: glossarian-install' marker. Files without the marker are
 never overwritten, removed, or executed.

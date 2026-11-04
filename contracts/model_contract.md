@@ -1,6 +1,15 @@
-Contract version: v2
+Contract version: v3
 
 # model — Glossary structural parse: Contract
+
+> **v3 — section field blocks and Reserved Targets rows (2026-11-04).** Two additive
+> structures: (1) the `## Governance` section's leading ```` ```glossary ```` block is parsed
+> into `GlossaryModel.governance: SectionFields` (it carries the `governs:` scope the linter
+> validates via `glossarian.scope`); (2) the data rows of the table under `## Reserved
+> Targets` are parsed into `reserved_target_rows: list[ReservedTargetRow]`, each with the
+> slug its first cell names. A generic `section_lines(name)` helper exposes any `##`
+> section's lines. Parse-only, as before: which `governs` is safe and whether every row names
+> a reserved target is `glossary_format_check` v6 policy.
 
 `glossarian.model.parse(text) -> GlossaryModel` turns glossary markdown into a typed
 **structural** model: the front-matter `key: scalar` map, the fence-aware body lines, the
@@ -58,6 +67,18 @@ index that Sedric's glossary query tool layers on top.
   `None` when the section is absent.
 - **`definition_blocks: list[TermBlock | StrayBlock]`** — the Definitions section parsed
   into ordered typed blocks (below).
+- **`governance_heading_line: int | None`** and **`governance: SectionFields`** (v3) — the
+  line of `## Governance` and its leading field block: `present`, `line` (opening fence),
+  `unterminated`, `fields` (the `key: value` map, e.g. `{"governs": "../"}`; `{}` when
+  absent). The block must be the section's first non-blank content, exactly as for a term.
+- **`reserved_targets_heading_line: int | None`** and **`reserved_target_rows:
+  list[ReservedTargetRow]`** (v3) — the line of `## Reserved Targets` and the data rows of
+  the first pipe table in that section (header row and `|---|` separator skipped, fenced
+  lines ignored): `line`, `cell` (the first cell, stripped), `slug` (the fragment of the
+  first link in the cell when there is one, else `github_slug` of the cell text with
+  backticks and `*` removed; `_` is kept because it is part of a term).
+- **`section_lines(name) -> list[Line] | None`** (v3) — the lines of the first `## <name>`
+  section up to the next `##`, or `None`.
 - **`headings(level)`** — helper returning all body headings at a given level, in order.
 
 Block types:
@@ -122,6 +143,14 @@ parse contract.`
 5. **Parse-only.** The module records structure and never raises on "invalid" input — an
    empty body, a bold paragraph, a duplicate slug, an unknown field key are all faithfully
    represented, not rejected. Judging them is the linter's job.
+6. **Governance field block (v3).** The same field-block parser as behavior 4, applied to the
+   lines of `## Governance`: a ```` ```glossary ```` fence that is the section's first
+   non-blank content fills `governance.fields`; one appearing after prose is ordinary body
+   and `governance.present` stays `False`.
+7. **Reserved Targets rows (v3).** Within `## Reserved Targets`, lines starting with `|`
+   outside fences form the table; the first such line is the header and any `|---|`-style
+   line is a separator; each remaining line yields a `ReservedTargetRow` whose `slug` comes
+   from the first cell as described under Outputs. Rows with an empty first cell are skipped.
 
 Anything the module does beyond producing this structure is undeclared drift.
 
@@ -153,3 +182,9 @@ Anything the module does beyond producing this structure is undeclared drift.
   re-verify `glossary_format_check` and its fixtures.
 - When the `contracts.15` semantic layer lands, it consumes this model; widening the model
   to serve it should be additive, preserving the structural fields the linter reads.
+
+## Revision history
+
+- v3 — Governance field block (`governs:`), Reserved Targets rows, and `section_lines`
+  (2026-11-04), consumed by glossary_format_check v6 and gather_reference_terms v3.
+- v2 — field block and relaxed body (see the note at the top).

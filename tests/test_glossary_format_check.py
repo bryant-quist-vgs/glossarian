@@ -1,4 +1,16 @@
-"""test_glossary_format_check — tests for glossarian.glossary_format_check, contract v5.
+"""test_glossary_format_check — tests for glossarian.glossary_format_check, contract v6.
+
+v6 coverage (appended at the end of the file):
+  - Rule 4 (v6): `## Reserved Targets` is the fifth required section.
+  - Rule 4b: the Governance field block — missing block, missing `governs`, unknown key,
+    malformed value (absolute / home-relative / URL), and the filesystem half: a scope that
+    escapes the repository root, one that excludes the glossary, a missing directory, and the
+    `--repo-root` override; the pure-text API skips the filesystem half.
+  - Rule 5c/5d (v6): `reserved-for` is open — it must name a `reserved-for-target: true`
+    term; `reserved-for-target` must be true/false; each target needs a row under
+    `## Reserved Targets` and each row must name a target.
+  - Rule 7 (v6): fixable violations carry `fix`, the report prints the `glossarian-fix`
+    hint and the summary count, and non-fixable ones do not.
 
 Coverage (one test or more per contract rule / load-bearing behavior). The linter is pure
 *policy* over the glossarian.model parse:
@@ -48,6 +60,10 @@ Intro prose pointing readers at the sections below.
 
 ## Governance
 
+```glossary
+governs: ../
+```
+
 Rules about how the glossary is maintained.
 
 ## Definitions
@@ -69,7 +85,23 @@ A completability gate value; the human holds the token.
 | Avoid | Use | Why |
 |---|---|---|
 | x | y | z |
+
+## Reserved Targets
+
+None.
 """
+
+GOVERNANCE_BLOCK = "```glossary\ngoverns: ../\n```\n\n"
+
+
+def repo_glossary(tmp_path: Path, text: str = VALID) -> Path:
+    """Write `text` as <tmp>/repo/docs/glossary.md inside a fake repository (a `.git` dir)."""
+    (tmp_path / "repo" / ".git").mkdir(parents=True)
+    docs = tmp_path / "repo" / "docs"
+    docs.mkdir()
+    p = docs / "glossary.md"
+    p.write_text(text, encoding="utf-8")
+    return p
 
 
 def msgs(text: str) -> list[str]:
@@ -100,9 +132,7 @@ def test_valid_glossary_is_clean() -> None:
 
 
 def test_valid_glossary_main_exit_zero(tmp_path: Path) -> None:
-    p = tmp_path / "glossary.md"
-    p.write_text(VALID, encoding="utf-8")
-    assert gfc.main([str(p)]) == 0
+    assert gfc.main([str(repo_glossary(tmp_path))]) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -158,7 +188,7 @@ def test_wrong_h1_name() -> None:
 
 
 def test_missing_required_section() -> None:
-    text = VALID.replace("## Governance\n\nRules about how the glossary is maintained.\n\n", "")
+    text = VALID.replace("## Governance\n\n" + GOVERNANCE_BLOCK + "Rules about how the glossary is maintained.\n\n", "")
     assert has("missing required section `## Governance`", msgs(text))
 
 
@@ -171,12 +201,12 @@ def test_section_casing_mismatch_is_violation() -> None:
 def test_wrong_section_order() -> None:
     # Swap Governance and Definitions so the required four appear out of canonical order.
     text = VALID.replace(
-        "## Governance\n\nRules about how the glossary is maintained.\n\n## Definitions",
+        "## Governance\n\n" + GOVERNANCE_BLOCK + "Rules about how the glossary is maintained.\n\n## Definitions",
         "## Definitions",
     )
     text = text.replace(
         "## Confusable Pairs",
-        "## Governance\n\nMoved out of order.\n\n## Confusable Pairs",
+        "## Governance\n\n" + GOVERNANCE_BLOCK + "Moved out of order.\n\n## Confusable Pairs",
     )
     assert has("malformed section order", msgs(text))
 
@@ -372,14 +402,21 @@ def test_unknown_field_key_rejected() -> None:
     assert has("unknown field-block key `definition`", msgs(text))
 
 
-def test_invalid_reserved_for_rejected() -> None:
+def test_reserved_for_must_name_a_reserved_target() -> None:
+    # v6: `reserved-for` is open, but its value must be the slug of a reserved-target term.
     text = _with_field_block("reserved-for: martians")
-    assert has("`reserved-for` must be one of", msgs(text))
+    assert has("`reserved-for: martians` in term `working agent` does not name a reserved target", msgs(text))
 
 
-def test_valid_reserved_for_accepted() -> None:
-    text = _with_field_block("reserved-for: lacey")
-    assert not has("reserved-for", msgs(text))
+def test_reserved_for_resolving_to_target_accepted() -> None:
+    text = _with_field_block("reserved-for: human_holds")
+    text = text.replace("### human_holds\n", "### human_holds\n```glossary\nreserved-for-target: true\n```\n").replace(
+        "## Reserved Targets\n\nNone.", RESERVED_TABLE + "| [human_holds](glossary.md#human_holds) | gate | | |"
+    )
+    assert not has("reserved", msgs(text))
+
+
+RESERVED_TABLE = "## Reserved Targets\n\n| Target | What it is | Local | Remote |\n|---|---|---|---|\n"
 
 
 def test_dangling_see_rejected() -> None:
@@ -456,13 +493,12 @@ def test_violations_exit_one(tmp_path: Path) -> None:
 
 def test_script_never_writes(tmp_path: Path) -> None:
     # Load-bearing capability boundary: validator is read-only — no file output.
-    p = tmp_path / "glossary.md"
-    p.write_text(VALID, encoding="utf-8")
-    before_listing = sorted(x.name for x in tmp_path.iterdir())
+    p = repo_glossary(tmp_path)
+    before_listing = sorted(str(x) for x in tmp_path.rglob("*"))
     before_content = p.read_text(encoding="utf-8")
     gfc.main([str(p)])
     gfc.main([str(p), "--quiet"])
-    assert sorted(x.name for x in tmp_path.iterdir()) == before_listing  # no new files
+    assert sorted(str(x) for x in tmp_path.rglob("*")) == before_listing  # no new files
     assert p.read_text(encoding="utf-8") == before_content  # input untouched
 
 
@@ -488,3 +524,158 @@ def test_quiet_suppresses_output(tmp_path: Path, capsys) -> None:
     out = capsys.readouterr().out
     assert rc == 1  # still reports failure via exit code
     assert out == ""  # but prints nothing
+
+
+# --------------------------------------------------------------------------- #
+# v6 — Rule 4: the fifth required section                                      #
+# --------------------------------------------------------------------------- #
+
+
+def test_reserved_targets_is_required_and_fixable() -> None:
+    text = VALID.replace("\n## Reserved Targets\n\nNone.\n", "")
+    violations, _w, _c = gfc.validate(text)
+    v = next(v for v in violations if v.code == "section-missing")
+    assert "`## Reserved Targets`" in v.msg
+    assert v.fix is not None and "append `## Reserved Targets`" in v.fix
+
+
+def test_reserved_targets_must_be_last_in_order() -> None:
+    renames = "## Renames and deprecated terms\n\n| Avoid | Use | Why |\n|---|---|---|\n| x | y | z |\n\n"
+    text = VALID.replace(
+        renames + "## Reserved Targets\n\nNone.\n",
+        "## Reserved Targets\n\nNone.\n\n## Renames and deprecated terms\n\nNone yet.\n",
+    )
+    assert has("malformed section order", msgs(text))
+
+
+# --------------------------------------------------------------------------- #
+# v6 — Rule 4b: the Governance field block and the `governs` scope             #
+# --------------------------------------------------------------------------- #
+
+
+def codes(text: str, **kw: object) -> list[str]:
+    violations, _w, _c = gfc.validate(text, **kw)  # type: ignore[arg-type]
+    return [v.code for v in violations]
+
+
+def test_governance_block_missing_is_violation() -> None:
+    text = VALID.replace(GOVERNANCE_BLOCK, "")
+    assert "governance-block-missing" in codes(text)
+
+
+def test_governs_key_missing_is_violation() -> None:
+    text = VALID.replace("governs: ../", "scope: ../")
+    found = codes(text)
+    assert "governs-missing" in found and "governance-key-unknown" in found
+
+
+def test_governs_absolute_home_and_url_rejected_without_filesystem() -> None:
+    for bad in ("/etc", "~/docs", "https://example.com/docs"):
+        assert "governs-invalid" in codes(VALID.replace("governs: ../", f"governs: {bad}")), bad
+    assert "governs-invalid" not in codes(VALID.replace("governs: ../", "governs: ../../../../../"))  # text API: no fs
+
+
+def test_governs_escaping_repo_root_rejected_on_disk(tmp_path: Path) -> None:
+    # Load-bearing: no glossary may govern above its repository root.
+    p = repo_glossary(tmp_path, VALID.replace("governs: ../", "governs: ../../"))
+    violations, _w, _c = gfc.validate(p.read_text(encoding="utf-8"), glossary_path=p)
+    assert any(v.code == "governs-invalid" and "escapes the repository root" in v.msg for v in violations)
+    assert gfc.main([str(p)]) == 1
+
+
+def test_governs_must_contain_the_glossary(tmp_path: Path) -> None:
+    p = repo_glossary(tmp_path)
+    (tmp_path / "repo" / "src").mkdir()
+    text = VALID.replace("governs: ../", "governs: ../src")
+    p.write_text(text, encoding="utf-8")
+    violations, _w, _c = gfc.validate(text, glossary_path=p)
+    assert any(v.code == "governs-invalid" and "does not contain the glossary" in v.msg for v in violations)
+
+
+def test_governs_missing_directory_rejected(tmp_path: Path) -> None:
+    p = repo_glossary(tmp_path, VALID.replace("governs: ../", "governs: ../nope"))
+    assert gfc.main([str(p)]) == 1
+
+
+def test_governs_dot_and_repo_root_override(tmp_path: Path) -> None:
+    # `.` is the glossary's own directory; --repo-root bounds the scope when no .git exists.
+    docs = tmp_path / "plain" / "docs"
+    docs.mkdir(parents=True)
+    p = docs / "glossary.md"
+    p.write_text(VALID.replace("governs: ../", "governs: ."), encoding="utf-8")
+    assert gfc.main([str(p)]) == 1  # no .git above, no override -> cannot bound the scope
+    assert gfc.main([str(p), "--repo-root", str(tmp_path / "plain")]) == 0
+    assert gfc.main([str(p), f"--repo-root={tmp_path / 'plain'}"]) == 0
+
+
+def test_bad_usage_exits_2(tmp_path: Path) -> None:
+    p = repo_glossary(tmp_path)
+    assert gfc.main([str(p), "--repo-root"]) == 2
+    assert gfc.main([str(p), "--bogus"]) == 2
+    assert gfc.main([str(p), "extra"]) == 2
+
+
+# --------------------------------------------------------------------------- #
+# v6 — Rule 5d: reserved targets                                               #
+# --------------------------------------------------------------------------- #
+
+
+def _with_target(rows: str, flag: str = "true") -> str:
+    text = VALID.replace("### human_holds\n", f"### human_holds\n```glossary\nreserved-for-target: {flag}\n```\n")
+    return text.replace("## Reserved Targets\n\nNone.", RESERVED_TABLE + rows)
+
+
+def test_reserved_target_needs_a_row() -> None:
+    assert "reserved-target-no-row" in codes(_with_target(""))
+
+
+def test_reserved_row_link_or_plain_text_names_target() -> None:
+    assert "reserved-target-no-row" not in codes(_with_target("| [gate](glossary.md#human_holds) | g | | |"))
+    assert codes(_with_target("| `human_holds` | g | ~/x | https://x |")) == []
+
+
+def test_reserved_row_naming_non_target_is_violation() -> None:
+    text = _with_target(
+        "| [human_holds](glossary.md#human_holds) | g | | |\n| [working agent](glossary.md#working-agent) | g | | |"
+    )
+    assert "reserved-row-unknown" in codes(text)
+
+
+def test_reserved_for_target_false_is_not_a_target() -> None:
+    text = _with_target("", flag="false")
+    assert "reserved-target-no-row" not in codes(text)
+    assert "field-reserved-for-target-value" in codes(_with_target("", flag="yes"))
+
+
+def test_reserved_for_term_form_gets_fix_hint() -> None:
+    text = _with_target("| [human_holds](glossary.md#human_holds) | g | | |")
+    text = text.replace(
+        "### working agent\n", "### working agent\n```glossary\nreserved-for: Human_Holds, martians\n```\n"
+    )
+    violations, _w, _c = gfc.validate(text)
+    rf = [v for v in violations if v.code == "field-reserved-for-unresolved"]
+    assert len(rf) == 2
+    assert any(v.fix and "as the slug `human_holds`" in v.fix for v in rf)  # github_slug form offered
+    assert any(v.fix is None for v in rf)  # martians cannot be guessed
+
+
+# --------------------------------------------------------------------------- #
+# v6 — Rule 7: fix hints in the report                                         #
+# --------------------------------------------------------------------------- #
+
+
+def test_fixable_violations_print_fix_command(tmp_path: Path, capsys) -> None:
+    text = VALID.replace("## Confusable Pairs", "## Confusable pairs").replace("is_source_of_truth: true\n", "")
+    p = repo_glossary(tmp_path, text)
+    assert gfc.main([str(p)]) == 1
+    out = capsys.readouterr().out
+    assert f"fixable: `glossarian-fix {p}` would rename `## Confusable pairs` to `## Confusable Pairs`" in out
+    assert "would add `is_source_of_truth: true`" in out
+    assert f"2 issues can be repaired automatically: run `glossarian-fix {p}`" in out
+
+
+def test_non_fixable_violation_has_no_hint(tmp_path: Path, capsys) -> None:
+    p = repo_glossary(tmp_path, VALID.replace("### working agent", "### working (agent)"))
+    gfc.main([str(p)])
+    out = capsys.readouterr().out
+    assert "  fixable:" not in out and "can be repaired automatically" not in out

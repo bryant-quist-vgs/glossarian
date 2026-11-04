@@ -1,6 +1,20 @@
-Contract version: v2
+Contract version: v3
 
 # gather_reference_terms — Inbound glossary-link resolver: Contract
+
+> **v3 — path resolution and governed scope (2026-11-04).** A repository may hold several
+> glossaries (a tooling glossary and a knowledge-base glossary side by side). Three changes:
+> (1) each link's **path is resolved relative to the linking file**, as GitHub resolves it,
+> to find the glossary it actually names — the v1/v2 "basename only" matching (which let
+> `docs/glossary.md#x` from `docs/diagrams/` resolve) is gone, and such a link is now
+> `missing-glossary`; (2) the linking file must lie inside the **scope that glossary governs**
+> (`governs:` under `## Governance`, resolved by the shared `glossarian.scope`), else the
+> reference is `out-of-scope`; (3) the report and JSON are keyed `<glossary>#<slug>`, carry a
+> per-reference **status** (`resolved`, `missing-glossary`, `not-a-glossary`,
+> `invalid-scope`, `out-of-scope`, `unresolved-anchor`), and describe every linked glossary.
+> `--glossary PATH` is now a **filter** (report only references targeting that file) rather
+> than the anchor source; `--repo-root DIR` bounds the scope when no `.git` is above the
+> glossaries. Exit semantics are unchanged: `0` only when every reference fully resolves.
 
 Scan a documentation tree (default `docs/`) for inbound `glossary.md#<slug>` fragment
 links, deduplicate the referenced slugs, build the set of anchors the glossary actually
@@ -35,9 +49,12 @@ write is a JSON report file — it never edits any documentation or glossary fil
 - **Argv positional `docs_root`** — zero or one path; defaults to `docs/`. The directory
   tree scanned recursively for inbound glossary links. **Trust:** operator-provided. A
   missing/unreadable directory is exit 2.
-- **`--glossary PATH`** — optional; defaults to `docs/glossary.md`. The glossary whose
-  heading anchors define the valid target set. **Trust:** operator-provided. A
-  missing/unreadable/undecodable glossary is exit 2.
+- **`--glossary PATH`** — optional (v3: no default). A **filter**: only references whose
+  resolved path is this file are reported; references to other glossaries are skipped.
+  **Trust:** operator-provided. A missing/unreadable PATH is exit 2.
+- **`--repo-root DIR`** — optional (v3). The repository root a `governs` scope may not
+  escape; default is the nearest `.git` above each glossary (see `scope` contract). A
+  missing DIR is exit 2.
 - **`--quiet`** — suppress all stdout/stderr reporting; rely on the exit code. Overrides every
   other reporting flag (a `--json FILE` artifact is still written — see Outputs).
 - **`--failures`** — *scope:* narrow the term listing to the failing (unresolved) terms only;
@@ -167,11 +184,14 @@ FAILED
   (header + footer per verbosity) unless `--quiet`.
 - **Shape** (independent of the `--failures`/`--terms-only`/`--verbose` flags — the JSON
   always carries the complete findings):
-  - `docs_root`, `glossary` — the resolved paths scanned.
+  - `docs_root` — the path scanned; `glossary` — the `--glossary` filter or `null` (v3).
+  - `glossaries` (v3) — a sorted map `path -> { exists, is_glossary, anchor_count, governs,
+    scope, error }` for every glossary some reference named.
   - `files_scanned` — count; `files` — the sorted list of scanned (non-archived) files.
-  - `terms` — a sorted map `slug -> { resolved: bool, reference_count: int, references:
-    [{ file, line }] }`.
-  - `summary` — `{ files_scanned, terms_total, resolved, unresolved, result: "OK"|"FAILED" }`.
+  - `terms` — a sorted map `"<glossary>#<slug>" -> { glossary, slug, resolved: bool, status,
+    reference_count: int, references: [{ file, line, status }] }` (v3 keys and fields).
+  - `summary` — `{ files_scanned, glossaries, terms_total, resolved, unresolved,
+    references_by_status: {status: count}, result: "OK"|"FAILED" }`.
   `Load-bearing: this shape is the machine contract for any JSON consumer (the checklist's
   evidence capture at 2.4/5.1, CI). It does NOT embed the --verbose source-context lines
   (a text-report-only aid). Field renames or removals are load-bearing changes.`
@@ -207,29 +227,40 @@ Anything not listed here is undeclared drift.
 
 2. **Extract inbound glossary references.** In each scanned file, find every link target
    whose path component's basename is `glossary.md` immediately followed by `#<fragment>`,
-   capturing the fragment and its 1-based source line. Accept the bare form
-   (`glossary.md#slug`), relative forms (`./glossary.md#…`, `../glossary.md#…`), and
-   path-prefixed forms (`docs/glossary.md#…`, used by the `diagrams/` subdir docs). The
-   fragment is captured up to the first link-terminating character. Deduplicate into a map of
-   `slug -> sorted set of "file:line"` references.
-   `Load-bearing: task 2.3 fixtures cover direct links, relative links, duplicate references,
-   underscore slugs, and hyphenated slugs.`
+   capturing the path prefix, the fragment, and its 1-based source line. Accept the bare form
+   (`glossary.md#slug`) and any path-prefixed form (`./`, `../`, `sub/`, …). The fragment is
+   captured up to the first link-terminating character. **Resolve the path relative to the
+   linking file's directory (v3)** — `os.path.normpath(file.parent / prefix / "glossary.md")`
+   — so the reference names one concrete glossary file; a `docs/glossary.md#…` link written
+   inside `docs/diagrams/` names `docs/diagrams/docs/glossary.md`, exactly as GitHub would.
+   Deduplicate into a map of `(glossary, slug) -> sorted set of "file:line"` references.
+   `Load-bearing: fixtures cover direct links, relative links, duplicate references,
+   underscore slugs, hyphenated slugs, and (v3) the subdir-prefixed form now being missing.`
 
-3. **Build the valid anchor set from the live glossary.** Parse `--glossary` with
-   `glossarian.model.parse` and compute `glossarian.github_slug(heading_text)` for **every
-   ATX heading in the model's fence-aware body, at every level** — the exact set of fragment
-   anchors GitHub auto-generates for that file. Term definitions (the `###` headings under
-   `## Definitions` the migration creates) are part of this set; so are `# Glossary`,
-   `## Governance`, etc.
+3. **Load each linked glossary once (v3).** For every distinct resolved glossary path: if the
+   file is missing, record `exists: false`; otherwise parse it with `glossarian.model.parse`;
+   if its front matter lacks `id: glossary`, record `error` (not a glossary); else compute
+   the anchor set — `glossarian.github_slug(heading_text)` for **every ATX heading in the
+   model's fence-aware body, at every level** (term `###` headings, `# Glossary`,
+   `## Governance`, …) — and resolve its scope with `glossarian.scope.resolve_scope(path,
+   governs, repo_root)`, recording the scope or the `ScopeError` reason (an absent `governs`
+   is recorded as an error too).
    `Load-bearing: the slug is the shared github_slug (one definition, no drift) so a slug in
    this set equals GitHub's real anchor; underscores are preserved (human_holds, managed_by),
    spaces become hyphens, and the General/Supplemental Punctuation blocks are stripped — all
    delegated to github_slug, never re-implemented here.`
 
-4. **Resolve each referenced slug against the anchor set.** A distinct referenced fragment
-   *resolves* iff it is a member of the anchor set (literal comparison; GitHub anchors are
-   already lowercased by `github_slug`). Collect **all** slugs that do not resolve — never
-   fail-fast — together with their referencing `file:line` list.
+4. **Give each reference a status (v3).** In order: `missing-glossary` (no file at the
+   resolved path), `not-a-glossary` (no `id: glossary`), `invalid-scope` (no or unsafe
+   `governs`; the glossary's `error` says why), `out-of-scope` (the linking file is not
+   inside the glossary's resolved scope — `scope.governs_path`), `unresolved-anchor` (the
+   fragment is not in the anchor set; literal comparison, anchors already lowercased by
+   `github_slug`), else `resolved`. A term finding is *resolved* iff **every** reference to
+   it is; its `status` is the first non-resolved reference's. Collect **all** failures —
+   never fail-fast.
+   `Load-bearing: out-of-scope is what makes "the item linking to the glossary is indeed
+   governed by that glossary" machine-checked; a doc under kb/ linking ../docs/glossary.md
+   when that glossary governs only docs/ fails CI.`
    `Load-bearing: this is GitHub-fidelity resolution, so a fragment an author wrote that
    github_slug would not emit for any heading (e.g. the inbound requirements-items-llm vs the
    heading slug requirements→items-llm, or any link into the pre-migration bold-paragraph
@@ -274,10 +305,12 @@ Anything not listed here is undeclared drift.
 
 ## Declared capability surface
 
-- **Filesystem reads:** the `*.md` files under `docs_root` (default `docs/`) and the
-  `--glossary` file (default `docs/glossary.md`). No reads outside `docs_root` and the
-  glossary path. The `--verbose` source context is sliced from the file contents already read
-  for reference extraction — no re-read or read elsewhere.
+- **Filesystem reads:** the `*.md` files under `docs_root` (default `docs/`), every glossary
+  file a scanned link resolves to (v3 — these may lie outside `docs_root`, e.g.
+  `../kb/glossary.md`; only files whose basename is `glossary.md` are ever opened), plus the
+  `is_dir`/`.git`-existence probes of `glossarian.scope`. The `--verbose` source context is
+  sliced from the file contents already read for reference extraction — no re-read or read
+  elsewhere.
 - **Filesystem writes:** at most the single `--json FILE` target, and only when it does
   **not** already exist (no overwrite/truncation) and its parent directory is writable. No
   writes when `--json FILE` is absent. In particular, no documentation or glossary file is
@@ -356,6 +389,12 @@ read in behavior 1 reuses `glossarian.model.parse` rather than a second front-ma
 
 ## Revision history
 
+- v3 — path resolution, governed scope, multi-glossary report (2026-11-04): behaviors 2–4
+  rewritten, `--glossary` becomes a filter, `--repo-root` added, text header lists every
+  linked glossary (`path — governs REL (N anchors)` / `— missing` / `— <error>`), unresolved
+  terms and their references carry `[status]` tags, JSON gains `glossaries`, per-reference
+  `status`, `summary.glossaries`, `summary.references_by_status`, and `<glossary>#<slug>`
+  term keys. Reads extend to linked glossaries outside `docs_root`.
 - v2 — standalone-repo graduation: `-h`/`--help` prints usage and exits 0 (input; behavior
   5 short-circuit), so the PATH-shim installer's `--check` has a read-nothing invocation to
   run. No link-form, anchor-set, JSON-shape, or capability change. Test path now relative to
