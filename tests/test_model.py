@@ -265,3 +265,77 @@ def test_terminated_field_block_not_flagged_unterminated() -> None:
     m = model.parse(text)
     wa = next(b for b in m.definition_blocks if isinstance(b, TermBlock) and b.term == "working agent")
     assert wa.field_block_present and wa.field_block_unterminated is False
+
+
+# --------------------------------------------------------------------------- #
+# v3 — Governance field block, section_lines, Reserved Targets rows             #
+# --------------------------------------------------------------------------- #
+
+V3 = """\
+---
+id: glossary
+---
+
+# Glossary
+
+## Governance
+
+```glossary
+governs: ../
+```
+
+Rules.
+
+## Definitions
+
+### lacey
+A tool.
+
+## Reserved Targets
+
+| Target | What it is | Local | Remote |
+|---|---|---|---|
+| [lacey](glossary.md#lacey) | tool | ~/lacey | github.com/x/lacey |
+| **Auditable Script** | convention | | |
+| `plain_text` | x | | |
+"""
+
+
+def test_governance_field_block_parsed() -> None:
+    m = model.parse(V3)
+    assert m.governance_heading_line == 7
+    assert m.governance.present and m.governance.line == 9
+    assert m.governance.fields == {"governs": "../"}
+    assert m.governance.unterminated is False
+
+
+def test_governance_without_block_is_absent_not_error() -> None:
+    m = model.parse(V3.replace("```glossary\ngoverns: ../\n```\n\n", ""))
+    assert m.governance_heading_line == 7
+    assert m.governance.present is False and m.governance.fields == {}
+
+
+def test_governance_block_must_be_first_content() -> None:
+    # A field block after prose is body, not the section's fields (same rule as term entries).
+    m = model.parse(V3.replace("```glossary\ngoverns: ../\n```\n\nRules.", "Rules.\n\n```glossary\ngoverns: ../\n```"))
+    assert m.governance.present is False
+
+
+def test_section_lines_helper() -> None:
+    m = model.parse(V3)
+    gov = m.section_lines("Governance")
+    assert gov is not None and gov[0].no == 8 and any(ln.raw == "Rules." for ln in gov)
+    assert m.section_lines("Nope") is None
+
+
+def test_reserved_target_rows_parsed() -> None:
+    m = model.parse(V3)
+    assert m.reserved_targets_heading_line == 20
+    rows = m.reserved_target_rows
+    assert [(r.line, r.slug) for r in rows] == [(24, "lacey"), (25, "auditable-script"), (26, "plain_text")]
+    assert rows[0].cell == "[lacey](glossary.md#lacey)"
+
+
+def test_reserved_target_rows_skip_fenced_tables() -> None:
+    text = V3.replace("| `plain_text` | x | | |", "\n```\n| fenced | | | |\n```")
+    assert [r.slug for r in model.parse(text).reserved_target_rows] == ["lacey", "auditable-script"]

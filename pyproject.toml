@@ -11,6 +11,8 @@ dependencies = []
 [project.scripts]
 glossarian-check = "glossarian.cli:check"
 glossarian-gather = "glossarian.cli:gather"
+glossarian-template = "glossarian.cli:template"
+glossarian-fix = "glossarian.cli:fix"
 
 [build-system]
 requires = ["hatchling"]

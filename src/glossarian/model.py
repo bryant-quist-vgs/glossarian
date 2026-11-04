@@ -80,6 +80,29 @@ Block = TermBlock | StrayBlock
 
 
 @dataclass
+class SectionFields:
+    """The typed ```glossary field block directly under a `##` section heading (v3).
+
+    Today only `## Governance` carries one (its `governs` scope declaration); the shape is
+    the same as a term entry's block so one parser serves both.
+    """
+
+    present: bool = False  # a ```glossary block was found as the section's first non-blank content
+    line: int | None = None  # 1-based line of the opening fence
+    unterminated: bool = False  # the fence ran to the section end with no close
+    fields: dict[str, str] = field(default_factory=dict)  # parsed key: value lines ({} when absent)
+
+
+@dataclass
+class ReservedTargetRow:
+    """One data row of the table under `## Reserved Targets` (v3): the target it names."""
+
+    line: int  # 1-based line of the row
+    cell: str  # the first cell's raw text, stripped
+    slug: str  # the `#slug` of the first link in the cell, else github_slug of the cell text
+
+
+@dataclass
 class GlossaryModel:
     """The structural model of a glossary document."""
 
@@ -88,10 +111,25 @@ class GlossaryModel:
     body: list[Line]  # fence-aware tagged body lines (everything after the front matter)
     definitions_heading_line: int | None  # line of `## Definitions`, or None if absent
     definition_blocks: list[Block] = field(default_factory=list)
+    # v3 — the Governance field block (carries `governs`) and the Reserved Targets rows.
+    governance_heading_line: int | None = None
+    governance: SectionFields = field(default_factory=SectionFields)
+    reserved_targets_heading_line: int | None = None
+    reserved_target_rows: list[ReservedTargetRow] = field(default_factory=list)
 
     def headings(self, level: int) -> list[Line]:
         """All body headings at the given level, in document order."""
         return [ln for ln in self.body if ln.is_heading and ln.level == level]
+
+    def section_lines(self, name: str) -> list[Line] | None:
+        """Body lines of the first `## <name>` section (heading excluded) up to the next `##`.
+
+        None when no such section exists.
+        """
+        start = _section_start(self.body, name)
+        if start is None:
+            return None
+        return _section_body(self.body, start)
 
 
 # --------------------------------------------------------------------------- #
@@ -259,23 +297,92 @@ def _parse_definition_blocks(section: list[Line]) -> list[Block]:
     return blocks
 
 
+def _section_start(body: list[Line], name: str) -> int | None:
+    """Index in `body` of the first `## <name>` heading, or None."""
+    return next((i for i, ln in enumerate(body) if ln.is_heading and ln.level == 2 and ln.htext == name), None)
+
+
+def _section_body(body: list[Line], start: int) -> list[Line]:
+    """Lines after the `##` heading at `start`, up to (excluding) the next `##` heading."""
+    section: list[Line] = []
+    for ln in body[start + 1 :]:
+        if ln.is_heading and ln.level == 2:
+            break
+        section.append(ln)
+    return section
+
+
+def _parse_section_fields(section: list[Line]) -> SectionFields:
+    """The optional ```glossary field block that is a section's first non-blank content (v3)."""
+    k = 0
+    while k < len(section) and section[k].blank:
+        k += 1
+    if k < len(section) and not section[k].is_heading and _opens_field_block(section[k]):
+        fields, _end, unterminated = _parse_field_block(section, k)
+        return SectionFields(present=True, line=section[k].no, unterminated=unterminated, fields=fields)
+    return SectionFields()
+
+
+_ROW_SEPARATOR_RE = re.compile(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")
+_FIRST_LINK_FRAGMENT_RE = re.compile(r"\]\([^)\s]*#([^)\s]+)\)")
+_INLINE_MARKUP = re.compile(r"[`*]")  # backticks and bold/italic stars; `_` is part of a term
+
+
+def _parse_reserved_target_rows(section: list[Line]) -> list[ReservedTargetRow]:
+    """Data rows of the first pipe table in the section: (line, first cell, target slug) (v3).
+
+    The header row and the `|---|` separator are skipped. The slug is the fragment of the
+    first link in the cell when there is one, else `github_slug` of the cell text with
+    inline markup (backticks, bold/italic stars) removed.
+    """
+    rows: list[ReservedTargetRow] = []
+    in_fence = False
+    table_lines: list[Line] = []
+    for ln in section:
+        if _is_fence(ln):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if ln.raw.lstrip().startswith("|"):
+            table_lines.append(ln)
+    for i, ln in enumerate(table_lines):
+        if i == 0 or _ROW_SEPARATOR_RE.match(ln.raw.strip()):
+            continue  # header row / separator
+        cells = ln.raw.strip().strip("|").split("|")
+        cell = cells[0].strip() if cells else ""
+        if not cell:
+            continue
+        m = _FIRST_LINK_FRAGMENT_RE.search(cell)
+        if m:
+            slug = m.group(1)
+        else:
+            text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", cell)  # a fragment-less link: keep its text
+            slug = github_slug(_INLINE_MARKUP.sub("", text).strip())
+        rows.append(ReservedTargetRow(line=ln.no, cell=cell, slug=slug))
+    return rows
+
+
 def parse(text: str) -> GlossaryModel:
     """Parse glossary markdown text into its structural model."""
     lines = text.splitlines()
     fm_inner, body, fm_error = _split_frontmatter(lines)
     frontmatter = _parse_frontmatter_scalars(fm_inner) if fm_error is None else {}
 
-    def_start = next(
-        (i for i, ln in enumerate(body) if ln.is_heading and ln.level == 2 and ln.htext == "Definitions"),
-        None,
-    )
-    if def_start is None:
-        return GlossaryModel(frontmatter, fm_error, body, None, [])
+    m = GlossaryModel(frontmatter, fm_error, body, None, [])
 
-    section: list[Line] = []
-    for ln in body[def_start + 1 :]:
-        if ln.is_heading and ln.level == 2:
-            break
-        section.append(ln)
-    blocks = _parse_definition_blocks(section)
-    return GlossaryModel(frontmatter, fm_error, body, body[def_start].no, blocks)
+    gov_start = _section_start(body, "Governance")
+    if gov_start is not None:
+        m.governance_heading_line = body[gov_start].no
+        m.governance = _parse_section_fields(_section_body(body, gov_start))
+
+    rt_start = _section_start(body, "Reserved Targets")
+    if rt_start is not None:
+        m.reserved_targets_heading_line = body[rt_start].no
+        m.reserved_target_rows = _parse_reserved_target_rows(_section_body(body, rt_start))
+
+    def_start = _section_start(body, "Definitions")
+    if def_start is not None:
+        m.definitions_heading_line = body[def_start].no
+        m.definition_blocks = _parse_definition_blocks(_section_body(body, def_start))
+    return m

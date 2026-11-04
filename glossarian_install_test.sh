@@ -40,7 +40,7 @@ SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)
 INSTALL="$SCRIPT_DIR/glossarian_install.sh"
 BASH_BIN=$(command -v bash)
 MARKER="managed-by: glossarian-install"
-NAMES="check gather"
+NAMES="check gather template fix"
 TESTS=0
 FAILURES=0
 SANDBOXES=""
@@ -145,7 +145,7 @@ test_install_writes_both_marked_shims() {
     out=$(cat "$box/out"); err=$(cat "$box/err")
     assert_eq "$rc" 0 "install exit code"
     assert_all_shims "$box/bin" "$SCRIPT_DIR"
-    assert_eq "$(ls "$box/bin" | wc -l | tr -d ' ')" 2 "exactly two files in prefix"
+    assert_eq "$(ls "$box/bin" | wc -l | tr -d ' ')" 4 "exactly four files in prefix"
     assert_contains "$out" "installed $box/bin/glossarian-check" "installed line on stdout"
     assert_contains "$out" "installed $box/bin/glossarian-gather" "installed line on stdout"
     assert_eq "$err" "" "nothing on stderr for a clean install"
@@ -270,8 +270,8 @@ test_check_passes_with_fake_uv_exit_0() {
     done
     assert_not_contains "$out" "FAIL" "no FAIL lines"
     assert_eq "$err" "" "nothing on stderr for a passing check"
-    assert_eq "$(grep -c "^uv run --project " "$box/fakebin/calls.log")" 2 "two uv invocations"
-    assert_eq "$(grep -c "^env UV_PYTHON_DOWNLOADS=never\$" "$box/fakebin/calls.log")" 2 "guard env set on every invocation"
+    assert_eq "$(grep -c "^uv run --project " "$box/fakebin/calls.log")" 4 "four uv invocations"
+    assert_eq "$(grep -c "^env UV_PYTHON_DOWNLOADS=never\$" "$box/fakebin/calls.log")" 4 "guard env set on every invocation"
 }
 
 test_check_reports_failures_with_fake_uv_exit_3() {
@@ -290,9 +290,9 @@ test_check_never_runs_missing_unmanaged_or_stale_shims() {
     # Behavior 10 / anti-pattern: only byte-identical marked shims are executed.
     local box out rc; box=$(sandbox)
     make_fake_uv "$box/fakebin" 0
-    # Case A: missing + unmanaged.
+    # Case A: missing + unmanaged (the other two shims removed too, so nothing is healthy).
     "$BASH_BIN" "$INSTALL" --prefix "$box/bin" >/dev/null 2>&1
-    rm -f "$box/bin/glossarian-check"
+    rm -f "$box/bin/glossarian-check" "$box/bin/glossarian-template" "$box/bin/glossarian-fix"
     printf '#!/bin/sh\necho ran-foreign >> "%s/foreign.log"\n' "$box" > "$box/bin/glossarian-gather"
     chmod +x "$box/bin/glossarian-gather"
     out=$(PATH="$box/fakebin:$PATH" "$BASH_BIN" "$INSTALL" --prefix "$box/bin" --check 2>&1); rc=$?
@@ -301,8 +301,8 @@ test_check_never_runs_missing_unmanaged_or_stale_shims() {
     assert_contains "$out" "FAIL glossarian-gather (unmanaged file, not run)" "unmanaged line"
     [ ! -e "$box/foreign.log" ] || fail "unmanaged files must not be executed by --check"
     [ ! -e "$box/fakebin/calls.log" ] || fail "nothing healthy to run: uv must not be invoked"
-    # Case B: stale (marker present, body differs) beside one healthy shim; positive control
-    # that the healthy shim IS run.
+    # Case B: stale (marker present, body differs) beside three healthy shims; positive control
+    # that the healthy shims ARE run.
     local box2; box2=$(sandbox)
     make_fake_uv "$box2/fakebin" 0
     "$BASH_BIN" "$INSTALL" --prefix "$box2/bin" >/dev/null 2>&1
@@ -313,7 +313,7 @@ test_check_never_runs_missing_unmanaged_or_stale_shims() {
     assert_contains "$out" "FAIL glossarian-gather (stale or foreign shim, not run)" "stale line"
     assert_contains "$out" "PASS glossarian-check" "healthy shim still passes"
     [ ! -e "$box2/foreign.log" ] || fail "stale files must not be executed by --check"
-    assert_eq "$(grep -c "^uv run" "$box2/fakebin/calls.log")" 1 "only the one healthy shim was run"
+    assert_eq "$(grep -c "^uv run" "$box2/fakebin/calls.log")" 3 "only the three healthy shims were run"
 }
 
 test_check_requires_uv_on_path() {

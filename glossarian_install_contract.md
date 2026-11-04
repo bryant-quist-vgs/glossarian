@@ -1,9 +1,10 @@
-Contract version: v0
+Contract version: v1
 
-# glossarian_install.sh — PATH-shim installer for `glossarian-check` and `glossarian-gather`: Contract
+# glossarian_install.sh — PATH-shim installer for the glossarian commands: Contract
 
-`glossarian_install.sh` is the operator-run installer that makes the two glossarian console
-scripts runnable from any directory in any repository with nothing but `PATH`. It writes one
+`glossarian_install.sh` is the operator-run installer that makes the four glossarian console
+scripts (`glossarian-check`, `glossarian-gather`, `glossarian-template`, `glossarian-fix`)
+runnable from any directory in any repository with nothing but `PATH`. It writes one
 small bash shim per command into a bin directory (`~/.local/bin` by default), each of which
 `exec`s `uv run --project "<ABS_REPO_ROOT>" --no-dev glossarian-<name> "$@"`, where
 `ABS_REPO_ROOT` is this checkout's root, resolved from the installer's own location at
@@ -81,7 +82,8 @@ each with tests). No lint rule, output, or capability of either tool changed.
 
 ## Outputs
 
-- **Shim files** at `<prefix>/glossarian-<name>` for `check` and `gather`, mode exactly
+- **Shim files** at `<prefix>/glossarian-<name>` for `check`, `gather`, `template`, and
+  `fix` (v1), mode exactly
   `0755`, exactly three lines:
 
   ```
@@ -283,3 +285,7 @@ run is green. Ratification is then a two-line edit: `Contract version: v0` → `
 
 - v0 — drafted ahead of the script from sedric's `install_sedric_lite.sh` contract v2
   conventions and the 2026-10-18 handoff.
+- v1 — two more shims, `glossarian-template` and `glossarian-fix`, for the console scripts
+  added in glossarian contract round 2 (2026-11-04). The shim body, marker, modes, and every
+  behavior are unchanged; `NAMES` grew from two entries to four, so `--check` now reports
+  four `PASS`/`FAIL` lines.

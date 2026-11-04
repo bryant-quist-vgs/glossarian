@@ -13,14 +13,21 @@ from __future__ import annotations
 
 from glossarian.github_slug import github_slug
 from glossarian.glossary_format_check import validate
-from glossarian.model import GlossaryModel, Line, StrayBlock, TermBlock, parse
+from glossarian.model import GlossaryModel, Line, ReservedTargetRow, SectionFields, StrayBlock, TermBlock, parse
+from glossarian.scope import ScopeError, find_repo_root, governs_path, resolve_scope
 
 __all__ = [
     "GlossaryModel",
     "Line",
+    "ReservedTargetRow",
+    "ScopeError",
+    "SectionFields",
     "StrayBlock",
     "TermBlock",
+    "find_repo_root",
     "github_slug",
+    "governs_path",
     "parse",
+    "resolve_scope",
     "validate",
 ]

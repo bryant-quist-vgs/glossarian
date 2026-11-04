@@ -2,18 +2,23 @@
 """gather_reference_terms — inbound glossary-link resolver.
 
 Scan a documentation tree (default ``docs/``) for inbound ``glossary.md#<slug>`` fragment
-links, deduplicate the referenced slugs, build the set of anchors the glossary actually
-exposes (``github_slug`` of every ATX heading in the glossary, via ``glossarian.model``),
-and **fail when a referenced slug resolves to no heading**. The link-integrity half of the
-glossary-anchor repair — the complement of ``glossary_format_check`` (which validates the
-glossary's own shape).
+links, resolve each link's **path** relative to the file that holds it (as GitHub does) to
+find the glossary it targets, check that the linking file lies inside the **scope that
+glossary governs** (its ``governs:`` declaration, via ``glossarian.scope``), build the set of
+anchors the glossary actually exposes (``github_slug`` of every ATX heading, via
+``glossarian.model``), and **fail when any reference does not fully resolve** — a missing
+glossary file, a file that is not a glossary, an unsafe scope, a linking file outside the
+scope, or a slug on no heading. The link-integrity complement of ``glossary_format_check``.
+
+Several glossaries may coexist in one tree (v3); each link is checked against the one its
+path names. ``--glossary PATH`` narrows the report to the references that target that file.
 
 Read-only except for one optional, never-overwriting ``--json FILE`` artifact. Never edits
 any documentation or glossary file. The exit code is the load-bearing signal:
-  0 = every referenced slug resolves · 1 = read OK but one or more unresolved ·
+  0 = every reference resolves · 1 = read OK but one or more do not ·
   2 = path/JSON-target/usage error.
 
-Built against contract v2 (v1 + `-h`/`--help` usage, behavior 5).
+Built against contract v3 (v2 + path resolution, scope check, multi-glossary report).
 Companion contract: contracts/gather_reference_terms_contract.md
 Tests:              tests/test_gather_reference_terms.py
 """
@@ -25,14 +30,13 @@ import os
 import re
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from glossarian import github_slug, model
+from glossarian import github_slug, model, scope
 
 DEFAULT_DOCS_ROOT = "docs"
-DEFAULT_GLOSSARY = "docs/glossary.md"
 DEFAULT_VERBOSE_N = 3
 
 # The framed-block rule rendered above/below each --verbose source-context window.
@@ -42,12 +46,19 @@ _FRAME = "    " + "-" * 26
 # `#<fragment>`. The fragment runs to the first link-terminating character (whitespace, a
 # paren/bracket/angle, a quote, a backtick, or `#`). The leading negative lookbehind keeps
 # `myglossary.md#x` from matching as a bare `glossary.md#x` (basename must be exact). The
-# optional path prefix (ending in `/`) accepts `./`, `../`, and `docs/` forms; matching is
-# by basename only (contract assumption: the relative path is not resolved to this file).
+# path prefix (`./`, `../`, `sub/`, ...) is resolved against the linking file's directory (v3).
 _LINK_CHARS = r"[^\s()<>\"'`#\[\]]"
-_GLOSSARY_REF = re.compile(rf"(?<![\w.\-])(?:{_LINK_CHARS}*/)?glossary\.md#(?P<frag>{_LINK_CHARS}+)")
+_GLOSSARY_REF = re.compile(rf"(?<![\w.\-])(?P<prefix>(?:{_LINK_CHARS}*/)?)glossary\.md#(?P<frag>{_LINK_CHARS}+)")
 
 _NUMBERISH = re.compile(r"-?\d+")
+
+# Reference statuses, in the order the text report explains them.
+RESOLVED = "resolved"
+MISSING_GLOSSARY = "missing-glossary"  # the link's path names no file
+NOT_A_GLOSSARY = "not-a-glossary"  # the file exists but its front matter lacks `id: glossary`
+INVALID_SCOPE = "invalid-scope"  # the glossary's `governs` is absent or unsafe (see glossary.error)
+OUT_OF_SCOPE = "out-of-scope"  # the linking file is not inside the glossary's governed scope
+UNRESOLVED_ANCHOR = "unresolved-anchor"  # the glossary has no heading with this slug
 
 
 # --------------------------------------------------------------------------- #
@@ -67,27 +78,59 @@ class _Exit2(Exception):
 class Reference:
     file: str
     line: int
+    status: str  # one of the statuses above
 
 
 @dataclass
 class TermFinding:
+    glossary: str  # display path of the glossary the links name (normalised, as linked)
     slug: str
-    resolved: bool
     references: list[Reference]  # sorted by (file, line)
+
+    @property
+    def key(self) -> str:
+        return f"{self.glossary}#{self.slug}"
+
+    @property
+    def resolved(self) -> bool:
+        return all(r.status == RESOLVED for r in self.references)
+
+    @property
+    def status(self) -> str:
+        """The worst status among the references (RESOLVED only when all resolve)."""
+        for r in self.references:
+            if r.status != RESOLVED:
+                return r.status
+        return RESOLVED
+
+
+@dataclass
+class GlossaryInfo:
+    """What the resolver learned about one linked glossary file."""
+
+    path: str  # display path
+    exists: bool
+    is_glossary: bool = False
+    anchors: set[str] = field(default_factory=set)
+    governs: str | None = None  # the raw `governs` value, when declared
+    scope: Path | None = None  # the resolved scope directory, when valid
+    error: str | None = None  # why the scope is invalid, when it is
 
 
 @dataclass
 class Findings:
     docs_root: str
-    glossary: str
+    glossary_filter: str | None  # the --glossary argument, when given
     files: list[str]  # sorted scanned (non-archived) files
-    terms: list[TermFinding]  # sorted by slug
+    glossaries: dict[str, GlossaryInfo]  # display path -> info, for every linked glossary
+    terms: list[TermFinding]  # sorted by (glossary, slug)
 
 
 @dataclass
 class Args:
     docs_root: str = DEFAULT_DOCS_ROOT
-    glossary: str = DEFAULT_GLOSSARY
+    glossary: str | None = None  # None = report every linked glossary
+    repo_root: str | None = None
     quiet: bool = False
     failures: bool = False
     terms_only: bool = False
@@ -112,15 +155,19 @@ def _parse_verbose_n(s: str) -> int:
 
 
 USAGE = """\
-Usage: glossarian-gather [DOCS_ROOT] [--glossary PATH] [--failures] [--terms-only | --verbose [N]]
-                         [--json [FILE]] [--debug] [--quiet]
+Usage: glossarian-gather [DOCS_ROOT] [--glossary PATH] [--repo-root DIR] [--failures]
+                         [--terms-only | --verbose [N]] [--json [FILE]] [--debug] [--quiet]
        glossarian-gather -h | --help
 
-Resolve inbound glossary.md#slug links under DOCS_ROOT (default docs/) against the headings
-of the glossary (default docs/glossary.md). Read-only except for --json FILE (never overwrites).
+Resolve inbound glossary.md#slug links under DOCS_ROOT (default docs/). Each link's path is
+resolved relative to the file holding it; the linking file must lie inside the scope that
+glossary governs (`governs:` under its ## Governance), and the slug must match one of the
+glossary's headings. Read-only except for --json FILE (never overwrites).
 
 Options:
-  --glossary PATH   glossary whose headings define the valid anchors
+  --glossary PATH   report only the references that target this glossary file
+  --repo-root DIR   the repository root a `governs` scope may not escape (default: the
+                    nearest ancestor of each glossary containing `.git`)
   --failures        list only unresolved terms
   --terms-only      term names only, no file:line references (excludes --verbose)
   --verbose [N]     quote N source lines of context around each reference (default 3)
@@ -154,6 +201,14 @@ def _parse_args(argv: list[str]) -> Args:
                 if i >= n:
                     raise _Exit2("--glossary requires a path argument")
                 a.glossary = argv[i]
+        elif tok == "--repo-root" or tok.startswith("--repo-root="):
+            if "=" in tok:
+                a.repo_root = tok.split("=", 1)[1]
+            else:
+                i += 1
+                if i >= n:
+                    raise _Exit2("--repo-root requires a directory argument")
+                a.repo_root = argv[i]
         elif tok == "--verbose" or tok.startswith("--verbose="):
             if "=" in tok:
                 a.verbose_n = _parse_verbose_n(tok.split("=", 1)[1])
@@ -186,14 +241,41 @@ def _parse_args(argv: list[str]) -> Args:
 # --------------------------------------------------------------------------- #
 
 
-def _scan(docs_root: Path, glossary: Path, dbg: Callable[[str], None]) -> tuple[Findings, dict[str, list[str]]]:
-    """Build the findings and a per-file line cache (for --verbose context)."""
-    gtext = glossary.read_text(encoding="utf-8")
+def _load_glossary(display: str, path: Path, repo_root: Path | None, dbg: Callable[[str], None]) -> GlossaryInfo:
+    """Read one linked glossary: its anchors and its governed scope (or why it has none)."""
+    if not path.is_file():
+        dbg(f"glossary {display}: missing")
+        return GlossaryInfo(path=display, exists=False)
+    gtext = path.read_text(encoding="utf-8")
     gmodel = model.parse(gtext)
-    anchors = {github_slug(ln.htext) for ln in gmodel.body if ln.is_heading}
-    dbg(f"glossary {glossary}: {len(anchors)} heading anchors")
+    info = GlossaryInfo(path=display, exists=True)
+    if gmodel.frontmatter.get("id") != "glossary":
+        info.error = "front matter does not declare `id: glossary`"
+        dbg(f"glossary {display}: not a glossary")
+        return info
+    info.is_glossary = True
+    info.anchors = {github_slug(ln.htext) for ln in gmodel.body if ln.is_heading}
+    governs = gmodel.governance.fields.get(scope.GOVERNS_KEY) if gmodel.governance.present else None
+    info.governs = governs
+    if governs is None:
+        info.error = "no `governs:` declared in the `## Governance` field block"
+    else:
+        try:
+            info.scope = scope.resolve_scope(path, governs, repo_root)
+        except scope.ScopeError as exc:
+            info.error = str(exc)
+    dbg(f"glossary {display}: {len(info.anchors)} heading anchors; scope={info.scope} error={info.error}")
+    return info
 
-    references: dict[str, set[tuple[str, int]]] = {}
+
+def _scan(
+    docs_root: Path, glossary_filter: str | None, repo_root: Path | None, dbg: Callable[[str], None]
+) -> tuple[Findings, dict[str, list[str]]]:
+    """Build the findings and a per-file line cache (for --verbose context)."""
+    filter_real = Path(glossary_filter).resolve() if glossary_filter is not None else None
+    glossaries: dict[str, GlossaryInfo] = {}  # display path -> info
+    real_to_display: dict[Path, str] = {}
+    references: dict[tuple[str, str], dict[tuple[str, int], str]] = {}
     file_lines: dict[str, list[str]] = {}
     scanned: list[str] = []
 
@@ -209,17 +291,42 @@ def _scan(docs_root: Path, glossary: Path, dbg: Callable[[str], None]) -> tuple[
         for lineno, raw in enumerate(lines, start=1):
             for m in _GLOSSARY_REF.finditer(raw):
                 frag = m.group("frag")
-                references.setdefault(frag, set()).add((fkey, lineno))
-                dbg(f"reference {frag} at {fkey}:{lineno}")
+                target = Path(os.path.normpath(path.parent / m.group("prefix") / "glossary.md"))
+                target_real = target.resolve()
+                if filter_real is not None and target_real != filter_real:
+                    dbg(f"skip reference to other glossary {target} at {fkey}:{lineno}")
+                    continue
+                display = real_to_display.setdefault(target_real, str(target))
+                if display not in glossaries:
+                    glossaries[display] = _load_glossary(display, target, repo_root, dbg)
+                info = glossaries[display]
+                if not info.exists:
+                    status = MISSING_GLOSSARY
+                elif not info.is_glossary:
+                    status = NOT_A_GLOSSARY
+                elif info.scope is None:
+                    status = INVALID_SCOPE
+                elif not scope.governs_path(info.scope, path):
+                    status = OUT_OF_SCOPE
+                elif frag not in info.anchors:
+                    status = UNRESOLVED_ANCHOR
+                else:
+                    status = RESOLVED
+                references.setdefault((display, frag), {})[(fkey, lineno)] = status
+                dbg(f"reference {display}#{frag} at {fkey}:{lineno}: {status}")
 
     terms: list[TermFinding] = []
-    for slug in sorted(references):
-        refs = [Reference(f, ln) for f, ln in sorted(references[slug])]
-        resolved = slug in anchors
-        dbg(f"resolve {slug}: {'ok' if resolved else 'UNRESOLVED'} ({len(refs)} refs)")
-        terms.append(TermFinding(slug=slug, resolved=resolved, references=refs))
+    for (display, slug), refs in sorted(references.items()):
+        ordered = [Reference(f, ln, st) for (f, ln), st in sorted(refs.items())]
+        terms.append(TermFinding(glossary=display, slug=slug, references=ordered))
 
-    findings = Findings(docs_root=str(docs_root), glossary=str(glossary), files=sorted(scanned), terms=terms)
+    findings = Findings(
+        docs_root=str(docs_root),
+        glossary_filter=glossary_filter,
+        files=sorted(scanned),
+        glossaries=dict(sorted(glossaries.items())),
+        terms=terms,
+    )
     return findings, file_lines
 
 
@@ -232,24 +339,44 @@ def findings_to_json(f: Findings) -> dict[str, Any]:
     """The machine contract shape (independent of the verbosity flags)."""
     resolved = sum(1 for t in f.terms if t.resolved)
     unresolved = len(f.terms) - resolved
+    by_status: dict[str, int] = {}
+    for t in f.terms:
+        for r in t.references:
+            by_status[r.status] = by_status.get(r.status, 0) + 1
     return {
         "docs_root": f.docs_root,
-        "glossary": f.glossary,
+        "glossary": f.glossary_filter,
+        "glossaries": {
+            g.path: {
+                "exists": g.exists,
+                "is_glossary": g.is_glossary,
+                "anchor_count": len(g.anchors),
+                "governs": g.governs,
+                "scope": str(g.scope) if g.scope is not None else None,
+                "error": g.error,
+            }
+            for g in f.glossaries.values()
+        },
         "files_scanned": len(f.files),
         "files": f.files,
         "terms": {
-            t.slug: {
+            t.key: {
+                "glossary": t.glossary,
+                "slug": t.slug,
                 "resolved": t.resolved,
+                "status": t.status,
                 "reference_count": len(t.references),
-                "references": [{"file": r.file, "line": r.line} for r in t.references],
+                "references": [{"file": r.file, "line": r.line, "status": r.status} for r in t.references],
             }
             for t in f.terms
         },
         "summary": {
             "files_scanned": len(f.files),
+            "glossaries": len(f.glossaries),
             "terms_total": len(f.terms),
             "resolved": resolved,
             "unresolved": unresolved,
+            "references_by_status": dict(sorted(by_status.items())),
             "result": "FAILED" if unresolved else "OK",
         },
     }
@@ -279,7 +406,19 @@ def render_text(
 ) -> list[str]:
     resolved = [t for t in f.terms if t.resolved]
     unresolved = [t for t in f.terms if not t.resolved]
-    out = [f"Scanning: {f.docs_root}", f"Glossary: {f.glossary}", ""]
+    out = [f"Scanning: {f.docs_root}"]
+    if f.glossary_filter is not None:
+        out.append(f"Glossary: {f.glossary_filter}")
+    else:
+        out.append(f"Glossaries: {len(f.glossaries)}")
+    for g in f.glossaries.values():
+        if not g.exists:
+            out.append(f"  {g.path} — missing")
+        elif g.error is not None:
+            out.append(f"  {g.path} — {g.error}")
+        else:
+            out.append(f"  {g.path} — governs {g.governs} ({len(g.anchors)} anchors)")
+    out.append("")
 
     groups: list[tuple[str, list[TermFinding]]] = []
     if not failures_only:
@@ -293,11 +432,13 @@ def render_text(
             out.append("")
         out.append(f"{label} ({len(terms)}):")
         for t in terms:
-            out.append(f"  {t.slug}")
+            tag = "" if t.resolved else f"  [{t.status}]"
+            out.append(f"  {t.key}{tag}")
             if terms_only:
                 continue
             for r in t.references:
-                out.append(f"    {r.file}:{r.line}")
+                rtag = "" if t.resolved else f"  [{r.status}]"
+                out.append(f"    {r.file}:{r.line}{rtag}")
                 if verbose_n is not None:
                     out.extend(_context_block(file_lines, r, verbose_n))
                     out.append("")
@@ -305,7 +446,10 @@ def render_text(
     while out and out[-1] == "":
         out.pop()
     out.append("")
-    out.append(f"Files scanned: {len(f.files)} | Terms resolved: {len(resolved)} | Terms unresolved: {len(unresolved)}")
+    out.append(
+        f"Files scanned: {len(f.files)} | Glossaries: {len(f.glossaries)} | "
+        f"Terms resolved: {len(resolved)} | Terms unresolved: {len(unresolved)}"
+    )
     out.append("FAILED" if unresolved else "OK")
     return out
 
@@ -354,16 +498,20 @@ def main(argv: list[str]) -> int:
             _check_json_target(Path(args.json_file))
 
         docs_root = Path(args.docs_root)
-        glossary = Path(args.glossary)
         if not docs_root.is_dir():
             raise _Exit2(f"docs_root is not a readable directory: {docs_root}")
+        if args.glossary is not None and not Path(args.glossary).is_file():
+            raise _Exit2(f"--glossary is not a readable file: {args.glossary}")
+        repo_root = Path(args.repo_root) if args.repo_root is not None else None
+        if repo_root is not None and not repo_root.is_dir():
+            raise _Exit2(f"--repo-root is not a directory: {repo_root}")
 
         def dbg(msg: str) -> None:
             if args.debug and not quiet:
                 print(f"[debug] {msg}", file=sys.stderr)
 
         try:
-            findings, file_lines = _scan(docs_root, glossary, dbg)
+            findings, file_lines = _scan(docs_root, args.glossary, repo_root, dbg)
         except (FileNotFoundError, IsADirectoryError, PermissionError, UnicodeDecodeError, OSError) as exc:
             raise _Exit2(f"cannot read: {exc}") from exc
 
